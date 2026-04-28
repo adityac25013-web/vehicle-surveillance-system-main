@@ -13,4 +13,5 @@ alembic
 pymysql
 python-dotenv
 deep-sort-realtime
+gunicorn
 

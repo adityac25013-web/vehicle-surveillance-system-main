@@ -5,52 +5,69 @@ const detectionsList = document.getElementById("detections-list");
 const historyList = document.getElementById("history-list");
 const videoStream = document.getElementById("video-stream");
 const streamPlaceholder = document.getElementById("stream-placeholder");
+const captureCanvas = document.createElement("canvas");
+let cameraReady = false;
 
-function startVideoFeed() {
-  const base = window.API_BASE_URL || "http://localhost:5000";
-  videoStream.src = base + "/video_feed";
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" },
+      audio: false,
+    });
+    videoStream.srcObject = stream;
+    await videoStream.play();
+    cameraReady = true;
+    streamPlaceholder.hidden = true;
+    videoStream.classList.remove("load-error");
+    videoStream.classList.add("loaded");
+  } catch (error) {
+    cameraReady = false;
+    videoStream.classList.add("load-error");
+    streamPlaceholder.hidden = false;
+    streamPlaceholder.textContent =
+      "Camera access denied/unavailable. Allow camera permission and refresh.";
+  }
 }
 
-videoStream.onload = function () {
-  streamPlaceholder.hidden = true;
-  videoStream.classList.remove("load-error");
-  videoStream.classList.add("loaded");
-};
-
-videoStream.onerror = function () {
-  videoStream.classList.add("load-error");
-};
+function renderEvents(events) {
+  if (!events || events.length === 0) {
+    detectionsList.textContent =
+      "No vehicles detected. Point the camera at cars or a screen showing cars.";
+    return;
+  }
+  const rows = events
+    .map((e) => {
+      const plate = (e.license_plate || "").trim();
+      const plateStr = plate ? ` • Plate: ${plate}` : "";
+      return `ID #${e.track_id ?? "-"} • ${e.label}${plateStr} • ${
+        e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : ""
+      }`;
+    })
+    .join("\n");
+  detectionsList.textContent = rows;
+}
 
 async function handlePing() {
   const { ok, data } = await window.apiClient.pingHealth();
   statusDot.classList.remove("ok", "error");
   statusDot.classList.add(ok ? "ok" : "error");
   healthResult.textContent = JSON.stringify(data, null, 2);
-  if (ok) startVideoFeed();
+  if (ok) await startCamera();
 }
 
-async function refreshDetections() {
-  const { ok, data } = await window.apiClient.fetchLiveEvents();
+async function processCurrentFrame() {
+  if (!cameraReady || !videoStream.videoWidth || !videoStream.videoHeight) return;
+  captureCanvas.width = videoStream.videoWidth;
+  captureCanvas.height = videoStream.videoHeight;
+  const ctx = captureCanvas.getContext("2d");
+  ctx.drawImage(videoStream, 0, 0, captureCanvas.width, captureCanvas.height);
+  const imageDataUrl = captureCanvas.toDataURL("image/jpeg", 0.9);
+  const { ok, data } = await window.apiClient.processFrame(imageDataUrl);
   if (!ok) {
-    detectionsList.textContent = "Error fetching detections.";
+    detectionsList.textContent = "Error processing frame on backend.";
     return;
   }
-
-  const events = data.events || [];
-  if (events.length === 0) {
-    detectionsList.textContent = "No vehicles detected. Point the camera at cars or a screen showing cars.";
-    return;
-  }
-
-  const rows = events
-    .map((e) => {
-      const plate = (e.license_plate || "").trim();
-      const plateStr = plate ? ` • Plate: ${plate}` : "";
-      return `ID #${e.track_id ?? "-"} • ${e.label}${plateStr} • ${e.timestamp ? new Date(e.timestamp).toLocaleTimeString() : ""}`;
-    })
-    .join("\n");
-
-  detectionsList.textContent = rows;
+  renderEvents(data.events || []);
 }
 
 async function refreshHistory() {
@@ -108,7 +125,6 @@ async function refreshHistory() {
 pingButton.addEventListener("click", handlePing);
 
 handlePing();
-setInterval(refreshDetections, 1000);
-setTimeout(startVideoFeed, 800);
+setInterval(processCurrentFrame, 1000);
 setInterval(refreshHistory, 3000);
 

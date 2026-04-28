@@ -9,6 +9,8 @@ def main() -> None:
 
     app = create_app()
     app.config["VIDEO_PROCESSOR"] = processor
+    # Reuse same detector instance to avoid loading YOLO twice in local mode.
+    app.config["DETECTION_PIPELINE"] = processor._pipeline
 
     try:
         app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
