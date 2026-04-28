@@ -14,5 +14,4 @@ Project layout:
 - `backend/` – Flask API, detection pipeline, database layer
 - `frontend/` – HTML/CSS/JS dashboard consuming the backend APIs/WebSockets
 
-You can open this folder in Cursor and start working on the backend and frontend separately.
 
