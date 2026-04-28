@@ -1,7 +1,7 @@
 const API_BASE_URL =
   window.__API_BASE_URL__ ||
   localStorage.getItem("API_BASE_URL") ||
-  "http://localhost:5000";
+  "https://vehicle-surveillance-backend-production.up.railway.app";
 window.API_BASE_URL = API_BASE_URL;
 
 async function pingHealth() {
