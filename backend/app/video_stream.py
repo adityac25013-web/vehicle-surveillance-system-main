@@ -11,7 +11,7 @@ from .detection import DetectionPipeline
 
 
 class VideoProcessor:
-    def __init__(self, camera_index: int = 0, detect_every_n_frames: int = 2) -> None:
+    def __init__(self, camera_index: int = 0, detect_every_n_frames: int = 4) -> None:
         self.camera_index = camera_index
         self.detect_every_n_frames = max(1, detect_every_n_frames)
         self._capture: Optional[cv2.VideoCapture] = None
@@ -25,33 +25,71 @@ class VideoProcessor:
         self._last_vis_frame: Optional[np.ndarray] = None
         self._last_events: List[Dict[str, Any]] = []
         self._consecutive_failures = 0
+        self._recent_loop_seconds: List[float] = []
+        self._recent_detect_seconds: List[float] = []
+        self._runtime_mode = "normal"
 
     def _open_capture(self) -> cv2.VideoCapture:
         """
-        Try a few camera indices with DirectShow first (Windows),
-        then default backend. Returns the first working capture.
+        Try camera indices/backends and prefer a non-black feed.
+        If all candidates look dark, fall back to the first opened capture.
         """
         indices_to_try = [self.camera_index, 0, 1, 2, 3]
         tried: List[int] = []
+        first_opened: Optional[cv2.VideoCapture] = None
+
+        def _probe_mean(cap: cv2.VideoCapture) -> float:
+            # Warm up and estimate frame brightness.
+            best = -1.0
+            for _ in range(20):
+                ok, frame = cap.read()
+                if not ok or frame is None or frame.size == 0:
+                    time.sleep(0.03)
+                    continue
+                m = float(frame.mean())
+                if m > best:
+                    best = m
+                # Clearly non-black frame
+                if m > 8.0:
+                    return m
+            return best
 
         for idx in indices_to_try:
             if idx in tried:
                 continue
             tried.append(idx)
 
-            # Prefer DirectShow on Windows to reduce MSMF issues
-            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-            if cap.isOpened():
-                self.camera_index = idx
-                return cap
-            cap.release()
-
-            # Fallback: default backend (may be MSMF or others)
+            # Prefer default backend first (often better on many laptops).
             cap = cv2.VideoCapture(idx)
             if cap.isOpened():
-                self.camera_index = idx
-                return cap
-            cap.release()
+                mean = _probe_mean(cap)
+                if mean > 8.0:
+                    self.camera_index = idx
+                    return cap
+                if first_opened is None:
+                    first_opened = cap
+                else:
+                    cap.release()
+            else:
+                cap.release()
+
+            # Fallback: DirectShow backend.
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                mean = _probe_mean(cap)
+                if mean > 8.0:
+                    self.camera_index = idx
+                    return cap
+                if first_opened is None:
+                    first_opened = cap
+                else:
+                    cap.release()
+            else:
+                cap.release()
+
+        if first_opened is not None:
+            self.camera_index = 0
+            return first_opened
 
         raise RuntimeError(
             "Unable to open any webcam (tried indices 0–3). "
@@ -65,7 +103,7 @@ class VideoProcessor:
         self._capture = self._open_capture()
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self._capture.set(cv2.CAP_PROP_FPS, 15)
+        self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         time.sleep(0.3)
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -90,6 +128,7 @@ class VideoProcessor:
 
     def _loop(self) -> None:
         while self._running and self._capture:
+            loop_t0 = time.perf_counter()
             ok, frame = self._capture.read()
             if not ok:
                 self._consecutive_failures += 1
@@ -112,10 +151,14 @@ class VideoProcessor:
             run_detection = (self._frame_count % self.detect_every_n_frames) == 0
 
             if run_detection:
+                detect_t0 = time.perf_counter()
                 events, vis_frame = self._pipeline.process_frame(frame)
+                detect_elapsed = time.perf_counter() - detect_t0
                 with self._lock:
                     self._last_events = events
                     self._last_vis_frame = vis_frame.copy()
+                    self._recent_detect_seconds.append(detect_elapsed)
+                    self._recent_detect_seconds = self._recent_detect_seconds[-60:]
             else:
                 with self._lock:
                     events = list(self._last_events)
@@ -159,6 +202,8 @@ class VideoProcessor:
                 self._latest_frame = jpeg.tobytes()
                 if run_detection:
                     self._latest_events = list(self._last_events)
+                self._recent_loop_seconds.append(time.perf_counter() - loop_t0)
+                self._recent_loop_seconds = self._recent_loop_seconds[-120:]
 
         if self._capture and self._capture.isOpened():
             self._capture.release()
@@ -176,4 +221,51 @@ class VideoProcessor:
     def get_latest_events(self) -> List[Dict[str, Any]]:
         with self._lock:
             return list(self._last_events)
+
+    def set_runtime_mode(self, mode: str) -> None:
+        mode_key = (mode or "").strip().lower()
+        if mode_key not in {"normal", "smooth", "accurate"}:
+            mode_key = "normal"
+        if mode_key == "smooth":
+            self.detect_every_n_frames = 6
+        elif mode_key == "accurate":
+            self.detect_every_n_frames = 2
+        else:
+            self.detect_every_n_frames = 4
+        self._runtime_mode = mode_key
+        self._pipeline.set_runtime_profile(mode_key)
+
+    def get_runtime_mode(self) -> str:
+        return self._runtime_mode
+
+    def reset_demo_state(self) -> None:
+        with self._lock:
+            self._last_events = []
+            self._latest_events = []
+            self._frame_count = 0
+            self._recent_loop_seconds.clear()
+            self._recent_detect_seconds.clear()
+        self._pipeline.reset_runtime_state()
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            recent_loop = list(self._recent_loop_seconds)
+            recent_detect = list(self._recent_detect_seconds)
+            failures = self._consecutive_failures
+            mode = self._runtime_mode
+        fps = 0.0
+        if recent_loop:
+            avg_loop = sum(recent_loop) / len(recent_loop)
+            if avg_loop > 0:
+                fps = 1.0 / avg_loop
+        detection_ms = 0.0
+        if recent_detect:
+            detection_ms = (sum(recent_detect) / len(recent_detect)) * 1000.0
+        return {
+            "fps": round(fps, 2),
+            "detection_ms": round(detection_ms, 1),
+            "mode": mode,
+            "camera_failures": failures,
+            "detect_every_n_frames": int(self.detect_every_n_frames),
+        }
 
